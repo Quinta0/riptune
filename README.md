@@ -2,11 +2,9 @@
 
 *Rip and tune.* A terminal-native music client for [Subsonic-compatible](http://www.subsonic.org/pages/api.jsp) servers (Navidrome, Airsonic, Gonic), built for the [niri](https://github.com/YaLTeR/niri) scrollable-tiling compositor. Because if id Software's engine can run on a smart fridge, your music player can run on a compositor IPC socket.
 
-> **Status:** early scaffold — architecture and interfaces are in place, implementation is in progress. See [Roadmap](#roadmap).
-
 ## Why
 
-Most terminal music clients treat the desktop as a black box: no MPRIS, no awareness of tiling layout, no way to hook into compositor-level keybinds. `riptune` is built the other way around — it assumes it's running inside a modern Wayland tiling setup and integrates accordingly.
+Most terminal music clients treat the desktop as a black box: no MPRIS, no awareness of tiling layout, no way to hook into compositor-level keybinds. `riptune` is built the other way around, it assumes it's running inside a modern Wayland tiling setup and integrates accordingly.
 
 ## Features
 
@@ -49,7 +47,7 @@ flowchart TB
     External2["niri compositor"] -.->|IPC socket| Niri
 ```
 
-**Why three execution contexts instead of one?** Audio playback is latency-sensitive in a way that async task scheduling doesn't guarantee — a busy tokio runtime (e.g. mid-sync with the server) shouldn't be able to introduce a buffer underrun. Giving audio its own OS thread with a bounded channel as the only interface makes that impossible by construction, not by careful scheduling.
+**Why three execution contexts instead of one?** Audio playback is latency-sensitive in a way that async task scheduling doesn't guarantee a busy tokio runtime (e.g. mid-sync with the server) shouldn't be able to introduce a buffer underrun. Giving audio its own OS thread with a bounded channel as the only interface makes that impossible by construction, not by careful scheduling.
 
 ## Repository layout
 
