@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/riptune-core",
+    "crates/riptune-cache",
+    "crates/riptune-mpris",
+    "crates/riptune-niri",
+    "crates/riptune-tui",
+    "crates/riptune-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+repository = "https://github.com/Quinta0/riptune"
+authors = ["Quintavalle Pietro"]
+
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[package]
+name = "riptune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A niri-native TUI music client for Subsonic servers. Rip and tune."
+
+[[bin]]
+name = "riptune"
+path = "src/main.rs"
+
+[dependencies]
+riptune-core = { path = "crates/riptune-core" }
+riptune-cache = { path = "crates/riptune-cache" }
+riptune-mpris = { path = "crates/riptune-mpris" }
+riptune-niri = { path = "crates/riptune-niri" }
+riptune-tui = { path = "crates/riptune-tui" }
+riptune-types = { path = "crates/riptune-types" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+# Pinned exactly: rodio 0.21 reworked the OutputStream/Sink API around a new
+# Mixer type (Sink::try_new -> Sink::connect_new, etc). Pinning avoids that
+# rewrite landing under us; bump deliberately and update audio.rs to match.
+rodio = { version = "=0.20.1", features = ["symphonia-all"] }
+# "blocking" is additive on top of the workspace-defined reqwest (which has
+# default-features = false + rustls-tls). Used only by the audio thread's
+# synchronous fetch -- see the comment in src/audio.rs for why blocking is
+# actually the right call there, not a shortcut.
+reqwest = { workspace = true, features = ["blocking"] }

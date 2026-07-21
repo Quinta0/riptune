@@ -1,0 +1,17 @@
+[package]
+name = "riptune-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ratatui-based terminal UI: artist/album browser, now-playing view, search"
+
+[dependencies]
+riptune-core = { path = "../riptune-core" }
+riptune-cache = { path = "../riptune-cache" }
+riptune-types = { path = "../riptune-types" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"

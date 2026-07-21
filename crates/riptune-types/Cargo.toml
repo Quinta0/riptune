@@ -1,0 +1,8 @@
+[package]
+name = "riptune-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared command/event types crossing thread and crate boundaries (audio, MPRIS, niri, TUI)"
+
+[dependencies]
