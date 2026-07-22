@@ -9,6 +9,8 @@ pub struct Config {
     pub niri: NiriConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub theme: riptune_types::ThemeColors,
 }
 
 #[derive(Debug, Clone, Deserialize)]

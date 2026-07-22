@@ -9,3 +9,13 @@ workspace_notifications = true
 
 [cache]
 path = "~/.cache/riptune/library.sqlite"
+
+# Optional. Every key here is optional too -- anything left out keeps
+# riptune's built-in default for that color. Values are "#rrggbb" hex.
+# [theme]
+# accent = "#89b4fa"
+# now_playing = "#a6e3a1"
+# error = "#f38ba8"
+# border_focused = "#89b4fa"
+# border_unfocused = "#585b70"
+# selection_bg = "#313244"

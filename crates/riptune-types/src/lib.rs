@@ -27,6 +27,27 @@ pub enum AudioEvent {
     Error(String),
 }
 
+/// User-overridable TUI colors, loaded from config.toml's `[theme]` table as
+/// `#rrggbb` hex strings. Lives here (not in riptune-tui) so the main crate's
+/// config loader can deserialize it directly and hand it to the TUI without
+/// a dependency cycle. Any field left unset, or that fails to parse, falls
+/// back to riptune-tui's built-in default for that color.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ThemeColors {
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub now_playing: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub border_focused: Option<String>,
+    #[serde(default)]
+    pub border_unfocused: Option<String>,
+    #[serde(default)]
+    pub selection_bg: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     /// User favorited/unfavorited a track (mirrors Subsonic star/unstar + can be

@@ -15,3 +15,15 @@ tracing = { workspace = true }
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
+# "image-defaults" (a default feature) would otherwise force-enable the full
+# `image` codec set (tiff/webp/av1/...) via feature unification with our own
+# trimmed `image` dep below -- disabled in favor of just the two codecs we
+# actually need. "rustix" is kept for accurate termios-based terminal
+# capability detection; "crossterm" matches our own ratatui backend.
+ratatui-image = { version = "2.0.1", default-features = false, features = ["crossterm", "rustix"] }
+# Subsonic/Navidrome cover art is effectively always PNG or JPEG -- trimmed
+# to those two codecs rather than pulling in image's full default set
+# (AV1, TIFF, WebP, ...), keeping the binary lean. Must match the `image`
+# version ratatui-image itself resolves to (see Cargo.lock) so DynamicImage
+# is the same type on both sides.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

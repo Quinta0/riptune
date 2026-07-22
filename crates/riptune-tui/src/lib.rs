@@ -1,17 +1,27 @@
+mod theme;
+
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
+use image::DynamicImage;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style, Color};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Gauge, Clear};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use riptune_cache::Cache;
 use riptune_core::models::{AlbumSummary, Artist, Track};
 use riptune_core::SubsonicClient;
 use riptune_types::{AudioCommand, AudioEvent};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -53,11 +63,13 @@ enum InputMode {
 struct NowPlaying {
     title: String,
     artist: String,
+    album: String,
     position: Duration,
     duration_secs: Option<u32>,
     status: PlaybackStatus,
     current_track_id: String,
     playlist_context: Vec<Track>,
+    cover_art_id: Option<String>,
 }
 
 pub struct App {
@@ -89,10 +101,45 @@ pub struct App {
     // Playback Engine Mods
     shuffle: bool,
     repeat: RepeatMode,
+
+    // List scroll state, persisted across frames (see `draw`) so the
+    // viewport doesn't reset to the top on every render.
+    artists_state: ListState,
+    albums_state: ListState,
+    tracks_state: ListState,
+
+    // Cover art. `cover_picker` is None if the terminal doesn't support (or
+    // detection of) an image protocol failed -- the art panel is then just
+    // skipped rather than erroring. Fetches run on the tokio runtime and
+    // report back over `cover_art_rx`; `cover_in_flight` stops the same id
+    // from being fetched twice while a request is outstanding.
+    cover_picker: Option<Picker>,
+    cover_cache: HashMap<String, Box<dyn StatefulProtocol>>,
+    cover_in_flight: HashSet<String>,
+    cover_art_tx: tokio::sync::mpsc::UnboundedSender<(String, Option<DynamicImage>)>,
+    cover_art_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Option<DynamicImage>)>,
+
+    theme: theme::Theme,
+}
+
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    }
 }
 
 impl App {
-    pub fn new(client: SubsonicClient, cache: Cache, audio_tx: Sender<AudioCommand>, audio_events: Receiver<AudioEvent>) -> Self {
+    pub fn new(
+        client: SubsonicClient,
+        cache: Cache,
+        audio_tx: Sender<AudioCommand>,
+        audio_events: Receiver<AudioEvent>,
+        theme_colors: riptune_types::ThemeColors,
+    ) -> Self {
+        let (cover_art_tx, cover_art_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             client,
             cache,
@@ -107,25 +154,48 @@ impl App {
             selected_idx: 0,
             now_playing: None,
             status_line: Some("Initializing Offline Cache...".into()),
-            volume: 0.8, 
+            volume: 0.8,
             input_mode: InputMode::Normal,
             search_query: String::new(),
             search_scope: SearchScope::Song,
             show_help: false,
             shuffle: false,
             repeat: RepeatMode::Off,
+            artists_state: ListState::default(),
+            albums_state: ListState::default(),
+            tracks_state: ListState::default(),
+            cover_picker: None,
+            cover_cache: HashMap::new(),
+            cover_in_flight: HashSet::new(),
+            cover_art_tx,
+            cover_art_rx,
+            theme: theme::Theme::from_config(&theme_colors),
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
         enable_raw_mode()?;
+
+        // Best-effort: query the terminal for an image graphics protocol
+        // (Kitty/iTerm2/Sixel, falling back to unicode half-blocks). If
+        // detection fails outright, cover art is simply not shown.
+        self.cover_picker = Picker::from_termios()
+            .ok()
+            .map(|mut picker| {
+                picker.guess_protocol();
+                picker
+            });
+
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        let _cleanup_guard = TerminalCleanup;
+
         let result = self.event_loop(&mut terminal).await;
 
+        // Explicit cleanup before returning
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
@@ -165,6 +235,12 @@ impl App {
                     }
                 }
                 _ = ticker.tick() => {}
+                Some((cover_id, image)) = self.cover_art_rx.recv() => {
+                    self.cover_in_flight.remove(&cover_id);
+                    if let (Some(image), Some(picker)) = (image, &mut self.cover_picker) {
+                        self.cover_cache.insert(cover_id, picker.new_resize_protocol(image));
+                    }
+                }
             }
         }
 
@@ -362,14 +438,19 @@ impl App {
         match self.client.stream_url(&track.id) {
             Ok(stream_url) => {
                 let _ = self.audio_tx.send(AudioCommand::Play { stream_url });
+                if let Some(cover_id) = &track.cover_art {
+                    self.request_cover_art(cover_id.clone());
+                }
                 self.now_playing = Some(NowPlaying {
                     title: track.title.clone(),
                     artist: track.artist.clone().unwrap_or_default(),
+                    album: track.album.clone().unwrap_or_default(),
                     position: Duration::ZERO,
                     duration_secs: track.duration_secs,
                     status: PlaybackStatus::Buffering,
                     current_track_id: track.id.clone(),
                     playlist_context,
+                    cover_art_id: track.cover_art.clone(),
                 });
                 self.notify_desktop_environment("Track Started");
             }
@@ -377,6 +458,26 @@ impl App {
                 self.status_line = Some(format!("failed to build stream url: {e}"));
             }
         }
+    }
+
+    /// Kicks off a background fetch+decode for a cover art id, unless it's
+    /// already cached or a fetch for it is already in flight. Errors are
+    /// swallowed -- missing art just means the panel stays empty.
+    fn request_cover_art(&mut self, cover_id: String) {
+        if self.cover_picker.is_none() || self.cover_cache.contains_key(&cover_id) || self.cover_in_flight.contains(&cover_id) {
+            return;
+        }
+        self.cover_in_flight.insert(cover_id.clone());
+
+        let client = self.client.clone();
+        let tx = self.cover_art_tx.clone();
+        tokio::spawn(async move {
+            let image = match client.get_cover_art(&cover_id).await {
+                Ok(bytes) => image::load_from_memory(&bytes).ok(),
+                Err(_) => None,
+            };
+            let _ = tx.send((cover_id, image));
+        });
     }
 
     fn toggle_play_pause(&mut self) {
@@ -456,7 +557,7 @@ impl App {
         }
     }
 
-    fn draw(&self, f: &mut ratatui::Frame) {
+    fn draw(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
 
         // --- 1. Layout Resizing Shield ---
@@ -465,7 +566,7 @@ impl App {
             let emergency_msg = Paragraph::new(
                 "\n\n  ⚠️ Terminal Window Too Small!\n  ===============================\n  Please enlarge your screen layout dimensions\n  to display Riptune's multi-tier grids safely."
             )
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Red)));
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(self.theme.error)));
             f.render_widget(emergency_msg, area);
             return;
         }
@@ -473,95 +574,219 @@ impl App {
         let main_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),    
-                Constraint::Length(3), 
-                Constraint::Length(3), 
+                Constraint::Min(3),
+                Constraint::Length(3),
+                Constraint::Length(7),
+                Constraint::Length(1),
             ])
             .split(area);
 
+        // Give the focused pane the room -- with a single artist and a
+        // handful of albums, an equal three-way split leaves the two
+        // breadcrumb panes mostly empty while Tracks (denser, especially
+        // once titles carry track numbers + durations) is cramped.
+        let (artists_pct, albums_pct, tracks_pct) = match self.focus {
+            FocusPane::Artists => (50, 30, 20),
+            FocusPane::Albums => (25, 50, 25),
+            FocusPane::Tracks => (20, 20, 60),
+        };
         let columns_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
+                Constraint::Percentage(artists_pct),
+                Constraint::Percentage(albums_pct),
+                Constraint::Percentage(tracks_pct),
             ])
             .split(main_layout[0]);
 
-        let artists_list: Vec<ListItem> = self.artists.iter().map(|a| ListItem::new(format!("  {}", a.name))).collect();
-        let albums_list: Vec<ListItem> = self.albums.iter().map(|a| ListItem::new(format!("  {}", a.name))).collect();
-        let tracks_list: Vec<ListItem> = self.tracks.iter().map(|t| ListItem::new(format!("  {}", t.title))).collect();
+        let now_playing_id = self.now_playing.as_ref().map(|np| np.current_track_id.as_str());
+
+        // Whether each pane's contents are currently the result of an
+        // active search in that pane's scope -- drives both the "Matching:
+        // N" title phrasing and per-row substring highlighting below. The
+        // pane's list itself is already filtered to matches by
+        // `execute_db_search`; this only affects how it's *labeled/shown*.
+        let searching = matches!(self.input_mode, InputMode::Search) && !self.search_query.is_empty();
+        let searching_artists = searching && self.search_scope == SearchScope::Artist;
+        let searching_albums = searching && self.search_scope == SearchScope::Album;
+        let searching_tracks = searching && self.search_scope == SearchScope::Song;
+        let match_style = Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+        let artists_col_width = columns_layout[0].width.saturating_sub(4) as usize;
+        let artists_list: Vec<ListItem> = self.artists.iter().map(|a| {
+            let query = searching_artists.then_some(self.search_query.as_str());
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(highlighted_spans(&a.name, artists_col_width, query, Style::default(), match_style));
+            ListItem::new(Line::from(spans))
+        }).collect();
+
+        let albums_col_width = columns_layout[1].width.saturating_sub(4) as usize;
+        let albums_list: Vec<ListItem> = self.albums.iter().map(|a| {
+            let query = searching_albums.then_some(self.search_query.as_str());
+            let suffix = album_suffix(a);
+            let name_budget = albums_col_width.saturating_sub(suffix.chars().count()).max(3);
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(highlighted_spans(&a.name, name_budget, query, Style::default(), match_style));
+            spans.push(Span::styled(suffix, Style::default().fg(self.theme.text_muted)));
+            ListItem::new(Line::from(spans))
+        }).collect();
+
+        // Duration right-aligned within the column, so it reads as a
+        // consistent right rail rather than trailing the title unevenly.
+        let tracks_col_width = columns_layout[2].width.saturating_sub(2) as usize;
+        let tracks_list: Vec<ListItem> = self.tracks.iter().map(|t| {
+            let is_now_playing = Some(t.id.as_str()) == now_playing_id;
+            let icon = if is_now_playing { " \u{266a} " } else { "  " };
+            let base_style = if is_now_playing {
+                Style::default().fg(self.theme.now_playing).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let duration = t.duration_secs.map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_else(|| "--:--".into());
+            let title_budget = tracks_col_width.saturating_sub(icon.chars().count() + duration.chars().count() + 1).max(3);
+            let query = searching_tracks.then_some(self.search_query.as_str());
+            let title_spans = highlighted_spans(&t.title, title_budget, query, base_style, match_style);
+            let title_len: usize = title_spans.iter().map(|s| s.content.chars().count()).sum();
+
+            let mut spans = vec![Span::styled(icon, base_style)];
+            spans.extend(title_spans);
+            let pad = tracks_col_width.saturating_sub(icon.chars().count() + title_len + duration.chars().count()).max(1);
+            spans.push(Span::styled(" ".repeat(pad), base_style));
+            spans.push(Span::styled(duration, base_style));
+
+            ListItem::new(Line::from(spans))
+        }).collect();
 
         let get_border_style = |pane: FocusPane| {
-            if self.focus == pane { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) }
+            if self.focus == pane { Style::default().fg(self.theme.border_focused) } else { Style::default().fg(self.theme.border_unfocused) }
+        };
+        // A background band for the keyboard cursor -- kept distinct from
+        // NOW_PLAYING's foreground-color-plus-icon treatment so the two
+        // states stay legible whether they land on the same row or not.
+        let cursor_highlight = Style::default().bg(self.theme.selection_bg).add_modifier(Modifier::BOLD);
+
+        self.artists_state.select(if self.focus == FocusPane::Artists { Some(self.selected_idx) } else { None });
+        self.albums_state.select(if self.focus == FocusPane::Albums { Some(self.selected_idx) } else { None });
+        self.tracks_state.select(if self.focus == FocusPane::Tracks { Some(self.selected_idx) } else { None });
+
+        let pane_title = |label: &str, len: usize, matching: bool| {
+            if matching { format!(" {label} (Matching: {len}) ") } else { format!(" {label} ({len}) ") }
         };
 
-        let mut left_state = ListState::default();
-        let mut mid_state = ListState::default();
-        let mut right_state = ListState::default();
+        f.render_stateful_widget(List::new(artists_list).block(Block::default().borders(Borders::ALL).title(pane_title(":: Artists", self.artists.len(), searching_artists)).border_style(get_border_style(FocusPane::Artists))).highlight_style(cursor_highlight), columns_layout[0], &mut self.artists_state);
+        f.render_stateful_widget(List::new(albums_list).block(Block::default().borders(Borders::ALL).title(pane_title("<> Albums", self.albums.len(), searching_albums)).border_style(get_border_style(FocusPane::Albums))).highlight_style(cursor_highlight), columns_layout[1], &mut self.albums_state);
+        f.render_stateful_widget(List::new(tracks_list).block(Block::default().borders(Borders::ALL).title(pane_title(">> Tracks", self.tracks.len(), searching_tracks)).border_style(get_border_style(FocusPane::Tracks))).highlight_style(cursor_highlight), columns_layout[2], &mut self.tracks_state);
 
-        match self.focus {
-            FocusPane::Artists => left_state.select(Some(self.selected_idx)),
-            FocusPane::Albums => mid_state.select(Some(self.selected_idx)),
-            FocusPane::Tracks => right_state.select(Some(self.selected_idx)),
+        render_scrollbar(f, columns_layout[0], self.artists.len(), self.artists_state.offset(), self.theme.border_unfocused);
+        render_scrollbar(f, columns_layout[1], self.albums.len(), self.albums_state.offset(), self.theme.border_unfocused);
+        render_scrollbar(f, columns_layout[2], self.tracks.len(), self.tracks_state.offset(), self.theme.border_unfocused);
+
+        let search_border = match self.input_mode {
+            InputMode::Search => self.theme.accent,
+            InputMode::Normal => self.theme.border_unfocused,
+        };
+        let (search_line, search_style) = match self.input_mode {
+            InputMode::Search => {
+                let scope_name = match self.search_scope {
+                    SearchScope::Artist => "Artist",
+                    SearchScope::Album => "Album",
+                    SearchScope::Song => "Song",
+                };
+                let left = format!(" $ search: {}\u{2588}", self.search_query);
+                let right = format!("[Target: {scope_name}] (TAB to cycle target) ");
+                let width = main_layout[1].width.saturating_sub(2) as usize;
+                let pad = width.saturating_sub(left.chars().count() + right.chars().count()).max(1);
+                (format!("{left}{}{right}", " ".repeat(pad)), Style::default())
+            }
+            InputMode::Normal => (" Press / to search".to_string(), Style::default().fg(self.theme.text_muted)),
+        };
+        f.render_widget(
+            Paragraph::new(search_line).style(search_style)
+                .block(Block::default().borders(Borders::ALL).title(" Search ").border_style(Style::default().fg(search_border))),
+            main_layout[1],
+        );
+
+        // --- Now Playing deck: title/artist/album/progress/volume unified
+        // into one panel instead of four separate blocks, so the elapsed
+        // time, the bar, and the volume/shuffle/repeat state read as one
+        // cohesive status rather than scattered fragments.
+        let deck_block = Block::default().borders(Borders::ALL).title(" Now Playing ");
+        let deck_inner = deck_block.inner(main_layout[2]);
+        f.render_widget(deck_block, main_layout[2]);
+
+        let cover_protocol = self.now_playing.as_ref()
+            .and_then(|np| np.cover_art_id.as_ref())
+            .and_then(|id| self.cover_cache.get_mut(id));
+        let art_width = if cover_protocol.is_some() { 14 } else { 0 };
+        let deck_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art_width), Constraint::Min(20)])
+            .split(deck_inner);
+
+        if let Some(protocol) = cover_protocol {
+            f.render_stateful_widget(StatefulImage::new(None), deck_split[0], protocol);
         }
 
-        f.render_stateful_widget(List::new(artists_list).block(Block::default().borders(Borders::ALL).title(" :: Artists ").border_style(get_border_style(FocusPane::Artists))).highlight_style(Style::default().add_modifier(Modifier::REVERSED)), columns_layout[0], &mut left_state);
-        f.render_stateful_widget(List::new(albums_list).block(Block::default().borders(Borders::ALL).title(" <> Albums ").border_style(get_border_style(FocusPane::Albums))).highlight_style(Style::default().add_modifier(Modifier::REVERSED)), columns_layout[1], &mut mid_state);
-        f.render_stateful_widget(List::new(tracks_list).block(Block::default().borders(Borders::ALL).title(" >> Tracks ").border_style(get_border_style(FocusPane::Tracks))).highlight_style(Style::default().add_modifier(Modifier::REVERSED)), columns_layout[2], &mut right_state);
-
-        let scope_indicator = match self.search_scope {
-            SearchScope::Artist => "[ARTIST] > Album > Song",
-            SearchScope::Album => "Artist > [ALBUM] > Song",
-            SearchScope::Song => "Artist > Album > [SONG]",
-        };
-        let search_title = match self.input_mode {
-            InputMode::Normal => " / Search (Press '/' to search globally, '?' for help) ".to_string(),
-            InputMode::Search => format!(" $ Searching (TAB switches query target) -- Target: {} ", scope_indicator),
-        };
-        f.render_widget(Paragraph::new(format!(" {}", self.search_query)).block(Block::default().borders(Borders::ALL).title(search_title)), main_layout[1]);
-
-        let dashboard_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Percentage(15)])
-            .split(main_layout[2]);
-
-        let now_playing_text = if let Some(np) = &self.now_playing {
-            let secs = np.position.as_secs();
-            format!("  {} -- {}  [{}:{:02}]", np.title, np.artist, secs / 60, secs % 60)
+        let title_line = if let Some(np) = &self.now_playing {
+            Line::from(vec![
+                Span::styled(format!("{} ", playback_label(&np.status)), Style::default().fg(self.theme.accent)),
+                Span::styled(np.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            ])
         } else {
-            "  Idle . Highlight a track and press Space or Enter".to_string()
+            Line::from(Span::styled(
+                "Idle -- highlight a track and press Space or Enter",
+                Style::default().fg(self.theme.text_muted),
+            ))
         };
-        let dashboard_title = if let Some(np) = &self.now_playing { format!(" {} ", playback_label(&np.status)) } else { " Player Status ".to_string() };
-        f.render_widget(Paragraph::new(now_playing_text).block(Block::default().borders(Borders::ALL).title(dashboard_title)), dashboard_layout[0]);
+        let artist_line = Line::from(format!("Artist: {}", self.now_playing.as_ref().map(|np| np.artist.as_str()).unwrap_or("")));
+        let album_line = Line::from(format!("Album:  {}", self.now_playing.as_ref().map(|np| np.album.as_str()).unwrap_or("")));
 
-        // --- 2. Shuffle & Repeat Status Indicators ---
+        let (elapsed_str, total_str, progress_ratio) = if let Some(np) = &self.now_playing {
+            let elapsed = np.position.as_secs();
+            let total = np.duration_secs.map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_else(|| "--:--".into());
+            let ratio = np.duration_secs
+                .filter(|&d| d > 0)
+                .map(|d| (np.position.as_secs() as f64 / d as f64).min(1.0))
+                .unwrap_or(0.0);
+            (format!("{}:{:02}", elapsed / 60, elapsed % 60), total, ratio)
+        } else {
+            ("--:--".to_string(), "--:--".to_string(), 0.0)
+        };
+        let text_width = deck_split[1].width as usize;
+        let progress_bar_width = text_width
+            .saturating_sub("Progress: [] ".len() + elapsed_str.len() + total_str.len() + 3)
+            .clamp(10, 60);
+        let progress_line = Line::from(vec![
+            Span::styled("Progress: ", Style::default().fg(self.theme.text_muted)),
+            Span::raw("["),
+            Span::styled(ascii_bar(progress_ratio, progress_bar_width, '=', '.', Some('>')), Style::default().fg(self.theme.progress)),
+            Span::raw(format!("] {elapsed_str} / {total_str}")),
+        ]);
+
         let shuffle_str = if self.shuffle { "ON" } else { "OFF" };
         let repeat_str = match self.repeat {
             RepeatMode::Off => "OFF",
             RepeatMode::One => "TRACK",
             RepeatMode::All => "QUEUE",
         };
-        let modes_text = format!("  Shuffle: {} | Repeat: {}", shuffle_str, repeat_str);
-        f.render_widget(Paragraph::new(modes_text).block(Block::default().borders(Borders::ALL).title(" Play Modes ([s]/[r]) ")), dashboard_layout[1]);
+        let volume_line = Line::from(vec![
+            Span::styled("Volume:   \u{1f50a} ", Style::default().fg(self.theme.text_muted)),
+            Span::styled(ascii_bar(self.volume as f64, 10, '\u{2588}', '\u{2591}', None), Style::default().fg(self.theme.volume)),
+            Span::raw(format!(
+                " {}%     |     Shuffle: {shuffle_str}     Repeat: {repeat_str}",
+                (self.volume * 100.0) as u16
+            )),
+        ]);
 
-        let progress_ratio = if let Some(np) = &self.now_playing {
-            if let Some(total) = np.duration_secs {
-                if total > 0 { (np.position.as_secs() as f64 / total as f64).min(1.0) } else { 0.0 }
-            } else { 0.0 }
-        } else { 0.0 };
+        f.render_widget(
+            Paragraph::new(vec![title_line, artist_line, album_line, progress_line, volume_line]),
+            deck_split[1],
+        );
 
-        let progress_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" Progression "))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(progress_ratio);
-        f.render_widget(progress_gauge, dashboard_layout[2]);
-
-        let volume_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" Vol ([-]/[+]) "))
-            .gauge_style(Style::default().fg(Color::Green))
-            .percent((self.volume * 100.0) as u16);
-        f.render_widget(volume_gauge, dashboard_layout[3]);
+        // --- Hotkey legend: one line at the very bottom instead of hints
+        // scattered across pane titles.
+        let legend = " [Space] Play/Pause   [/] Search   [h/l] Pane   [j/k] Move   [s] Shuffle   [r] Repeat   [+/-] Vol   [?] Help   [q] Quit";
+        f.render_widget(Paragraph::new(legend).style(Style::default().fg(self.theme.text_muted)), main_layout[3]);
 
         if self.show_help {
             let help_text = r#"
@@ -571,36 +796,150 @@ impl App {
    [l] / [Right]  : Focus right column / Expand directory
    [j] / [Down]   : Move selection cursor down
    [k] / [Up]     : Move selection cursor up
-   
+
    [Enter]        : Expand selection or Play track
    [Space]        : Toggle Play / Pause state
    [Esc]          : Clear query context or escape layout back
-   
+
    [/]            : Open universal search context box
    [TAB]          : Cycle target filtering scope ([SONG], [ARTIST])
-   
+
    [s]            : Toggle Shuffle playback order
    [r]            : Cycle Repeat Mode (Off -> Queue -> Track)
    [-] / [[]      : Decrease system volume output
    [+] / []]      : Increase system volume output
-   
+
    [?]            : Toggle this floating instructions overview overlay
    [q]            : Exit riptune application safely
             "#;
 
-            let block = Block::default().title(" Help Overlay Menu ").borders(Borders::ALL).border_style(Style::default().fg(Color::Magenta));
+            let block = Block::default().title(" Help Overlay Menu ").borders(Borders::ALL).border_style(Style::default().fg(self.theme.help_border));
             let paragraph = Paragraph::new(help_text).block(block);
-            
+
             let popup_area = Rect {
                 x: area.width / 4,
                 y: area.height / 5,
                 width: area.width / 2,
                 height: 3 * area.height / 5,
             };
-            
-            f.render_widget(Clear, popup_area); 
+
+            f.render_widget(Clear, popup_area);
             f.render_widget(paragraph, popup_area);
         }
+    }
+}
+
+/// Renders a vertical scrollbar along the right edge of `area`, inset to sit
+/// inside a bordered block's margins. A no-op when everything already fits.
+fn render_scrollbar(f: &mut ratatui::Frame, area: Rect, content_len: usize, offset: usize, color: ratatui::style::Color) {
+    if content_len <= area.height.saturating_sub(2) as usize {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_len).position(offset);
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .style(Style::default().fg(color));
+    f.render_stateful_widget(
+        scrollbar,
+        area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 0 }),
+        &mut state,
+    );
+}
+
+/// Track count + year suffix for an album row (`" — 18 tracks, 2025"`), so
+/// near-identical entries (duplicate imports, case-variant folder names,
+/// etc.) are distinguishable before the user commits to opening one.
+fn album_suffix(album: &AlbumSummary) -> String {
+    let tracks = format!("{} track{}", album.song_count, if album.song_count == 1 { "" } else { "s" });
+    match album.year {
+        Some(year) => format!(" — {tracks}, {year}"),
+        None => format!(" — {tracks}"),
+    }
+}
+
+/// Renders a horizontal `[===>....]`-style bar (or solid blocks when `tip`
+/// is `None`, for the volume meter) instead of a filled rectangle, so it
+/// reads as a line-based indicator consistent with the rest of the UI
+/// rather than a clashing solid block of color.
+fn ascii_bar(ratio: f64, width: usize, filled_char: char, empty_char: char, tip: Option<char>) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let ratio = ratio.clamp(0.0, 1.0);
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    match tip {
+        Some(tip_char) if filled > 0 && filled < width => {
+            let body = filled_char.to_string().repeat(filled - 1);
+            let rest = empty_char.to_string().repeat(width - filled);
+            format!("{body}{tip_char}{rest}")
+        }
+        _ => {
+            let body = filled_char.to_string().repeat(filled);
+            let rest = empty_char.to_string().repeat(width - filled);
+            format!("{body}{rest}")
+        }
+    }
+}
+
+/// Truncates to `max_chars`, appending an ellipsis when content was cut,
+/// instead of letting long names clip abruptly at the pane border.
+fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 1 {
+        return "\u{2026}".to_string();
+    }
+    let truncated: String = s.chars().take(max_chars - 1).collect();
+    format!("{truncated}\u{2026}")
+}
+
+/// Truncates `text` to `budget` characters, then -- if `query` is active and
+/// found (case-insensitive) within the truncated text -- splits it into
+/// styled spans so the matched substring pops instead of leaving the reader
+/// to guess why a row matched.
+fn highlighted_spans(text: &str, budget: usize, query: Option<&str>, base: Style, match_style: Style) -> Vec<Span<'static>> {
+    let text = truncate_ellipsis(text, budget);
+    let query = match query.filter(|q| !q.is_empty()) {
+        Some(q) => q,
+        None => return vec![Span::styled(text, base)],
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() || query_chars.len() > chars.len() {
+        return vec![Span::styled(text, base)];
+    }
+
+    let match_start = (0..=chars.len() - query_chars.len()).find(|&i| {
+        chars[i..i + query_chars.len()]
+            .iter()
+            .zip(&query_chars)
+            .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+    });
+
+    match match_start {
+        Some(start) => {
+            let before: String = chars[..start].iter().collect();
+            let matched: String = chars[start..start + query_chars.len()].iter().collect();
+            let after: String = chars[start + query_chars.len()..].iter().collect();
+            let mut spans = Vec::new();
+            if !before.is_empty() {
+                spans.push(Span::styled(before, base));
+            }
+            spans.push(Span::styled(matched, match_style));
+            if !after.is_empty() {
+                spans.push(Span::styled(after, base));
+            }
+            spans
+        }
+        None => vec![Span::styled(text, base)],
     }
 }
 

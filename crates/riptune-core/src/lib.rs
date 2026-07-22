@@ -35,7 +35,9 @@ pub struct SubsonicClient {
 impl SubsonicClient {
     pub fn new(base_url: &str, username: &str, password: &str) -> Result<Self, SubsonicError> {
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
             base_url: url::Url::parse(base_url)?,
             username: username.to_string(),
             password: password.to_string(),
@@ -75,6 +77,30 @@ impl SubsonicClient {
             qp.append_pair("id", track_id);
         }
         Ok(url.to_string())
+    }
+
+    /// Returns a fully-authenticated cover art URL for an id (album, artist,
+    /// or track -- whatever Navidrome/Subsonic returned as `coverArt`).
+    pub fn cover_art_url(&self, cover_art_id: &str) -> Result<String, SubsonicError> {
+        let mut url = self.base_url.join("rest/getCoverArt")?;
+        {
+            let mut qp = url.query_pairs_mut();
+            for (k, v) in self.auth_params() {
+                qp.append_pair(&k, &v);
+            }
+            qp.append_pair("id", cover_art_id);
+            qp.append_pair("size", "300");
+        }
+        Ok(url.to_string())
+    }
+
+    /// Fetches the raw image bytes for a cover art id. Unlike every other
+    /// endpoint here, `getCoverArt` returns the image directly rather than a
+    /// `subsonic-response` JSON envelope, so it bypasses `call<T>`.
+    pub async fn get_cover_art(&self, cover_art_id: &str) -> Result<Vec<u8>, SubsonicError> {
+        let url = self.cover_art_url(cover_art_id)?;
+        let bytes = self.http.get(url).send().await?.error_for_status()?.bytes().await?;
+        Ok(bytes.to_vec())
     }
 
     /// Sends an authenticated GET to `rest/{endpoint}`, unwraps the
@@ -220,6 +246,18 @@ mod tests {
     fn stream_url_never_leaks_the_raw_password() {
         let client = SubsonicClient::new("https://music.example.com", "alice", "hunter2").unwrap();
         let url = client.stream_url("track-123").unwrap();
+        assert!(!url.contains("hunter2"), "raw password must never appear in the URL: {url}");
+    }
+
+    #[test]
+    fn cover_art_url_includes_required_auth_params() {
+        let client = SubsonicClient::new("https://music.example.com", "alice", "hunter2").unwrap();
+        let url = client.cover_art_url("cover-123").unwrap();
+
+        assert!(url.starts_with("https://music.example.com/rest/getCoverArt"));
+        for param in ["u=alice", "t=", "s=", "v=", "c=riptune", "f=json", "id=cover-123"] {
+            assert!(url.contains(param), "expected `{param}` in {url}");
+        }
         assert!(!url.contains("hunter2"), "raw password must never appear in the URL: {url}");
     }
 }

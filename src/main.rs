@@ -1,12 +1,4 @@
 //! riptune — a niri-native TUI music client for Subsonic servers.
-//!
-//! Threading model (see README.md#architecture for the diagram):
-//!   - Tokio runtime: Subsonic API calls, streaming downloads, MPRIS D-Bus server,
-//!     niri IPC event listener. All async, all non-blocking.
-//!   - Audio thread: owns the cpal/symphonia decode+playback pipeline. Talks to the
-//!     rest of the app only via a bounded mpsc channel (commands in, position/state out).
-//!   - TUI thread (main): ratatui render loop. Never blocks on I/O — reads from
-//!     channels/shared state populated by the other two.
 
 mod app;
 mod audio;
@@ -37,34 +29,64 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging()?;
     let cli = Cli::parse();
 
-    let cfg = crate::config::Config::load(cli.config)?;
+    let cfg = config::Config::load(cli.config)?;
 
-    // Quick one-shot commands skip the audio thread, MPRIS, and TUI entirely —
-    // they exist to smoke-test the Subsonic client in isolation.
     if let Some(command) = cli.command {
         let runtime = tokio::runtime::Runtime::new()?;
         return runtime.block_on(run_command(command, cfg));
     }
 
-    // Audio runs on its own OS thread — decode/playback must not share a runtime
-    // with network I/O, or a slow server response can stutter playback.
-    let (audio_tx, audio_events, audio_handle) = audio::spawn(cfg.clone())?;
+    let (audio_tx, audio_events, _audio_handle) = audio::spawn(cfg.clone())?;
 
-    // Everything async (Subsonic client, MPRIS, niri IPC) shares one tokio runtime.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    runtime.block_on(app::run(cfg, audio_tx, audio_events))?;
+    runtime.block_on(async {
+        tokio::select! {
+            res = app::run(cfg, audio_tx, audio_events) => res,
+            _ = tokio::signal::ctrl_c() => {
+                // When Ctrl+C is pressed, returning Ok(()) drops the TUI instance,
+                // triggering the `TerminalCleanup` guard in riptune-tui automatically!
+                Ok(())
+            }
+        }
+    })
+}
 
-    audio_handle.join().ok();
+// Logs must never land on stdout/stderr: the TUI owns the terminal's
+// alternate screen, and any interleaved write (e.g. symphonia's demuxer
+// warnings) punches straight through the ratatui frame.
+fn init_logging() -> Result<()> {
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".local/state")
+        })
+        .join("riptune");
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("riptune.log"))?;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,symphonia=warn,reqwest=warn,zbus=warn"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .init();
+
     Ok(())
 }
 
-async fn run_command(command: Command, cfg: crate::config::Config) -> Result<()> {
+async fn run_command(command: Command, cfg: config::Config) -> Result<()> {
     let client = riptune_core::SubsonicClient::new(&cfg.server.url, &cfg.server.username, &cfg.server.password)?;
 
     match command {

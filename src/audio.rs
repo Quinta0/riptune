@@ -54,10 +54,22 @@ fn run_audio_loop(cmd_rx: Receiver<AudioCommand>, event_tx: Sender<AudioEvent>) 
     loop {
         // Short timeout so we still get to check on playback progress
         // (position/finished) even when no new command has arrived.
-        match cmd_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(command) => handle_command(command, &stream_handle, &mut sink, &http, &event_tx, &mut current_volume),
+        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(AudioCommand::Stop) => {
+                // Drop sink explicitly to free audio hardware resources
+                drop(sink.take());
+                break; // Exit the audio thread loop!
+            }
+            Ok(command) => handle_command(
+                command,
+                &stream_handle,
+                &mut sink,
+                &http,
+                &event_tx,
+                &mut current_volume,
+            ),
+            Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break, // sender dropped -> app is shutting down
         }
 
         if let Some(active) = &sink {

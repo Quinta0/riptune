@@ -5,6 +5,7 @@
 //! instances with 50k+ tracks). We index artists/albums/tracks locally and treat
 //! the network as a background sync source, not the read path for rendering[cite: 13].
 
+use futures_util::stream::{self, StreamExt};
 use riptune_core::SubsonicClient;
 use riptune_core::models::{Artist, Track, AlbumSummary};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -77,12 +78,25 @@ impl Cache {
         .execute(&pool)
         .await?;
 
+        // This is a rebuildable cache, not source-of-truth data, so schema
+        // evolution is a best-effort ALTER rather than a real migration --
+        // ignore the error if a column already exists. SQLite only allows
+        // one ADD COLUMN per statement.
+        for alter in [
+            "ALTER TABLE tracks ADD COLUMN cover_art TEXT",
+            "ALTER TABLE tracks ADD COLUMN track_number INTEGER",
+            "ALTER TABLE tracks ADD COLUMN disc_number INTEGER",
+            "ALTER TABLE albums ADD COLUMN year INTEGER",
+        ] {
+            let _ = sqlx::query(alter).execute(&pool).await;
+        }
+
         Ok(Self { pool })
     }
 
     pub async fn get_albums_by_artist(&self, artist_id: &str) -> Result<Vec<AlbumSummary>, CacheError> {
         let rows = sqlx::query(
-            "SELECT id, name, song_count FROM albums WHERE artist_id = ? ORDER BY name ASC"
+            "SELECT id, name, song_count, year FROM albums WHERE artist_id = ? ORDER BY name ASC"
         )
         .bind(artist_id)
         .fetch_all(&self.pool)
@@ -90,36 +104,33 @@ impl Cache {
 
         let records = rows.into_iter().map(|row| {
             let count: i64 = row.get("song_count");
+            let year: Option<i64> = row.get("year");
             AlbumSummary {
                 id: row.get("id"),
                 name: row.get("name"),
                 song_count: count as u32,
+                year: year.map(|y| y as u32),
             }
         }).collect();
 
         Ok(records)
     }
 
+    /// Tracklist for an album, in soundtrack order (disc, then track number)
+    /// rather than alphabetically -- falls back to title only for the rare
+    /// track missing a number, so it still sorts predictably.
     pub async fn get_tracks_by_album(&self, album_name: &str) -> Result<Vec<Track>, CacheError> {
         // FIXED: Added CAST protection to match what we did in the search query!
         let rows = sqlx::query(
-            "SELECT id, title, artist, album, duration_secs, CAST(starred AS TEXT) as starred FROM tracks WHERE album = ? ORDER BY title ASC"
+            "SELECT id, title, artist, album, duration_secs, CAST(starred AS TEXT) as starred, cover_art, track_number, disc_number \
+             FROM tracks WHERE album = ? \
+             ORDER BY COALESCE(disc_number, 1) ASC, COALESCE(track_number, 999999) ASC, title ASC"
         )
         .bind(album_name)
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows.into_iter().map(|row| {
-            let duration: Option<i64> = row.get("duration_secs");
-            Track {
-                id: row.get("id"),
-                title: row.get("title"),
-                artist: row.get("artist"),
-                album: row.get("album"),
-                duration_secs: duration.map(|d| d as u32),
-                starred: row.get("starred"),
-            }
-        }).collect();
+        let records = rows.into_iter().map(row_to_track).collect();
 
         Ok(records)
     }
@@ -149,7 +160,7 @@ impl Cache {
     pub async fn search_local_albums(&self, query: &str) -> Result<Vec<AlbumSummary>, CacheError> {
         let sql_pattern = format!("%{}%", query);
         let rows = sqlx::query(
-            "SELECT id, name, song_count FROM albums WHERE name LIKE ? COLLATE NOCASE ORDER BY name ASC"
+            "SELECT id, name, song_count, year FROM albums WHERE name LIKE ? COLLATE NOCASE ORDER BY name ASC"
         )
         .bind(sql_pattern)
         .fetch_all(&self.pool)
@@ -157,10 +168,12 @@ impl Cache {
 
         let records = rows.into_iter().map(|row| {
             let count: i64 = row.get("song_count");
+            let year: Option<i64> = row.get("year");
             AlbumSummary {
                 id: row.get("id"),
                 name: row.get("name"),
                 song_count: count as u32,
+                year: year.map(|y| y as u32),
             }
         }).collect();
 
@@ -169,39 +182,75 @@ impl Cache {
 
     pub async fn search_local_tracks(&self, query: &str) -> Result<Vec<Track>, CacheError> {
         let sql_pattern = format!("%{}%", query);
-        // FIXED: Using CAST forces SQLite to evaluate the column as a string primitive 
+        // FIXED: Using CAST forces SQLite to evaluate the column as a string primitive
         // regardless of whether the internal row data was stored as an integer or text.
         let rows = sqlx::query(
-            "SELECT id, title, artist, album, duration_secs, CAST(starred AS TEXT) as starred FROM tracks WHERE title LIKE ? COLLATE NOCASE ORDER BY title ASC"
+            "SELECT id, title, artist, album, duration_secs, CAST(starred AS TEXT) as starred, cover_art, track_number, disc_number \
+             FROM tracks WHERE title LIKE ? COLLATE NOCASE ORDER BY title ASC"
         )
         .bind(sql_pattern)
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows.into_iter().map(|row| {
-            let duration: Option<i64> = row.get("duration_secs");
-            Track {
-                id: row.get("id"),
-                title: row.get("title"),
-                artist: row.get("artist"),
-                album: row.get("album"),
-                duration_secs: duration.map(|d| d as u32),
-                starred: row.get("starred"), 
-            }
-        }).collect();
+        let records = rows.into_iter().map(row_to_track).collect();
 
         Ok(records)
     }
 }
 
+fn row_to_track(row: sqlx::sqlite::SqliteRow) -> Track {
+    let duration: Option<i64> = row.get("duration_secs");
+    let track_number: Option<i64> = row.get("track_number");
+    let disc_number: Option<i64> = row.get("disc_number");
+    Track {
+        id: row.get("id"),
+        title: row.get("title"),
+        artist: row.get("artist"),
+        album: row.get("album"),
+        duration_secs: duration.map(|d| d as u32),
+        starred: row.get("starred"),
+        cover_art: row.get("cover_art"),
+        track_number: track_number.map(|n| n as u32),
+        disc_number: disc_number.map(|n| n as u32),
+    }
+}
+
+// How many artist/album fetches run concurrently during a sync. Bounded so a
+// large library doesn't fire hundreds of simultaneous requests at once --
+// this is a request-count/latency tradeoff, not a hard server limit.
+const SYNC_CONCURRENCY: usize = 8;
+
 /// Pulls the full artist/album/track tree from the server and upserts it into
 /// the local cache. Intended to run as a background task on startup, and
 /// periodically thereafter — never blocks the TUI's first paint[cite: 13].
+///
+/// Fetching is done concurrently (bounded by `SYNC_CONCURRENCY`) since the
+/// Subsonic API requires one request per artist for albums and one more per
+/// album for full track data -- doing those serially is what made sync slow
+/// on real libraries. Writes stay sequential below: SQLite only has one
+/// writer anyway, and it's cheap compared to the network round trips.
 pub async fn sync_library(client: &SubsonicClient, cache: &Cache) -> Result<(), CacheError> {
     let remote_artists = client.get_artists().await
         .map_err(|e| CacheError::Client(e.to_string()))?;
 
-    for artist in remote_artists {
+    let fetched = stream::iter(remote_artists)
+        .map(|artist| async move {
+            let albums = client.get_artist_albums(&artist.id).await.unwrap_or_default();
+            let albums = stream::iter(albums)
+                .map(|album| async move {
+                    let songs = client.get_album(&album.id).await.map(|a| a.song).unwrap_or_default();
+                    (album, songs)
+                })
+                .buffer_unordered(SYNC_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            (artist, albums)
+        })
+        .buffer_unordered(SYNC_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    for (artist, albums) in fetched {
         let mut tx = cache.pool.begin().await?;
 
         sqlx::query("INSERT OR REPLACE INTO artists (id, name, album_count) VALUES (?, ?, ?)")
@@ -211,29 +260,29 @@ pub async fn sync_library(client: &SubsonicClient, cache: &Cache) -> Result<(), 
             .execute(&mut *tx)
             .await?;
 
-        if let Ok(albums) = client.get_artist_albums(&artist.id).await {
-            for album in albums {
-                sqlx::query("INSERT OR REPLACE INTO albums (id, name, song_count, artist_id) VALUES (?, ?, ?, ?)")
-                    .bind(&album.id)
-                    .bind(&album.name)
-                    .bind(album.song_count)
-                    .bind(&artist.id)
+        for (album, songs) in albums {
+            sqlx::query("INSERT OR REPLACE INTO albums (id, name, song_count, artist_id, year) VALUES (?, ?, ?, ?, ?)")
+                .bind(&album.id)
+                .bind(&album.name)
+                .bind(album.song_count)
+                .bind(&artist.id)
+                .bind(album.year)
+                .execute(&mut *tx)
+                .await?;
+
+            for song in songs {
+                sqlx::query("INSERT OR REPLACE INTO tracks (id, title, artist, album, duration_secs, starred, cover_art, track_number, disc_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                    .bind(&song.id)
+                    .bind(&song.title)
+                    .bind(&song.artist)
+                    .bind(&song.album)
+                    .bind(song.duration_secs)
+                    .bind(&song.starred) // Safely saves text strings directly into SQLite schema rows[cite: 14]
+                    .bind(&song.cover_art)
+                    .bind(song.track_number)
+                    .bind(song.disc_number)
                     .execute(&mut *tx)
                     .await?;
-
-                if let Ok(full_album) = client.get_album(&album.id).await {
-                    for song in full_album.song {
-                        sqlx::query("INSERT OR REPLACE INTO tracks (id, title, artist, album, duration_secs, starred) VALUES (?, ?, ?, ?, ?, ?)")
-                            .bind(&song.id)
-                            .bind(&song.title)
-                            .bind(&song.artist)
-                            .bind(&song.album)
-                            .bind(song.duration_secs)
-                            .bind(&song.starred) // Safely saves text strings directly into SQLite schema rows[cite: 14]
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                }
             }
         }
 

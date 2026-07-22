@@ -16,6 +16,8 @@ pub struct AlbumSummary {
     pub name: String,
     #[serde(rename = "songCount", default)]
     pub song_count: u32,
+    #[serde(default)]
+    pub year: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,4 +43,10 @@ pub struct Track {
     pub duration_secs: Option<u32>,
     #[serde(default)]
     pub starred: Option<String>,
+    #[serde(rename = "coverArt", default)]
+    pub cover_art: Option<String>,
+    #[serde(rename = "track", default)]
+    pub track_number: Option<u32>,
+    #[serde(rename = "discNumber", default)]
+    pub disc_number: Option<u32>,
 }
