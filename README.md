@@ -11,7 +11,29 @@ Most terminal music clients treat the desktop as a black box: no MPRIS, no aware
 - **MPRIS2 D-Bus interface** — waybar, GNOME/KDE media widgets, and hardware media keys control riptune out of the box, no riptune-specific config needed on their end.
 - **Decoupled async pipeline** — network I/O (tokio) and audio decode/playback (dedicated OS thread) never share a runtime, so a slow server response can't stutter playback or freeze the UI.
 - **niri IPC integration** — listens on niri's event-stream socket (not polling) to react to workspace changes; exposes a local control socket so niri keybinds can trigger in-app actions like favoriting a track.
-- **Local SQLite index** — the remote library is mirrored locally so the TUI opens instantly, even on servers with slow `getArtists`/`getAlbum` responses over large libraries.
+- **Local SQLite index** — the remote library is mirrored locally so the TUI opens instantly, even on servers with slow `getArtists`/`getAlbum` responses over large libraries; a fresh library sync fetches artists/albums/tracks concurrently rather than one request at a time.
+- **Inline cover art** — renders actual album art in the Now Playing panel via the Kitty/iTerm2/Sixel graphics protocol where the terminal supports it, falling back to a half-block truecolor approximation otherwise.
+- **Soundtrack-aware track order** — albums list by disc/track number, not alphabetically, so a game or film OST plays in the order the composer intended.
+- **Live search with match highlighting** — search narrows the Artists/Albums/Tracks pane it targets in real time, with the matched substring highlighted in each result.
+- **Configurable theme** — an optional `[theme]` table in `config.toml` overrides individual UI colors (accent, now-playing, borders, ...) without touching code.
+
+## Terminal UI
+
+![riptune TUI screenshot](image.png)
+
+Three browsing panes (Artists / Albums / Tracks) whose widths shift to favor whichever one is focused, a search bar, and a unified Now Playing deck (art, title/artist/album, a horizontal progress bar, and volume/shuffle/repeat) with a hotkey legend along the bottom.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` / `↓` / `↑` | Move selection |
+| `h` / `l` / `←` / `→` / `Enter` | Move between panes / expand selection / play |
+| `Space` | Play / pause |
+| `/` | Search (scope cycles with `Tab`; `Esc`/`Enter` to leave) |
+| `s` | Toggle shuffle |
+| `r` | Cycle repeat (off → queue → track) |
+| `+` / `-` | Volume up / down |
+| `?` | Toggle the help overlay |
+| `q` | Quit |
 
 ## Architecture
 
@@ -64,7 +86,8 @@ riptune/
 │   ├── riptune-cache/    # SQLite local index
 │   ├── riptune-mpris/    # MPRIS2 D-Bus server
 │   ├── riptune-niri/     # niri IPC event-stream listener
-│   └── riptune-tui/      # ratatui UI
+│   ├── riptune-tui/      # ratatui UI
+│   └── riptune-types/    # shared types crossing thread/crate boundaries
 ├── Cargo.toml            # workspace root
 └── config.example.toml
 ```
@@ -87,6 +110,16 @@ workspace_notifications = true
 
 [cache]
 path = "~/.cache/riptune/library.sqlite"
+
+# Optional. Every key is optional too -- anything left out keeps riptune's
+# built-in default for that color. Values are "#rrggbb" hex.
+# [theme]
+# accent = "#89b4fa"
+# now_playing = "#a6e3a1"
+# error = "#f38ba8"
+# border_focused = "#89b4fa"
+# border_unfocused = "#585b70"
+# selection_bg = "#313244"
 ```
 
 ## Building
