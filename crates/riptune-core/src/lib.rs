@@ -165,35 +165,25 @@ impl SubsonicClient {
         // We fetch the raw JSON value first so we can robustly extract the array
         // regardless of whether the server uses a flat index or nested structure.
         let response: serde_json::Value = self.call("getArtists", &[]).await?;
-        
-        let mut artists = Vec::new();
 
-        // Navigate safely through 'artists' -> 'index' array
-        if let Some(index_array) = response.get("artists").and_then(|a| a.get("index")).and_then(|i| i.as_array()) {
-            for group in index_array {
-                if let Some(artist_list) = group.get("artist").and_then(|a| a.as_array()) {
-                    for artist_val in artist_list {
-                        if let Ok(artist) = serde_json::from_value::<models::Artist>(artist_val.clone()) {
-                            artists.push(artist);
-                        }
-                    }
-                }
-            }
-        } 
-        // Fallback: Check if the server responds with a root level 'index' block directly
-        else if let Some(index_array) = response.get("index").and_then(|i| i.as_array()) {
-            for group in index_array {
-                if let Some(artist_list) = group.get("artist").and_then(|a| a.as_array()) {
-                    for artist_val in artist_list {
-                        if let Ok(artist) = serde_json::from_value::<models::Artist>(artist_val.clone()) {
-                            artists.push(artist);
-                        }
-                    }
-                }
-            }
-        }
+        // Some servers nest the index under 'artists', others put it at the
+        // root -- try 'artists.index' first, then fall back to root 'index'.
+        let index_array = response
+            .get("artists")
+            .and_then(|a| a.get("index"))
+            .or_else(|| response.get("index"))
+            .and_then(|i| i.as_array());
 
-        Ok(artists)
+        let Some(index_array) = index_array else {
+            return Ok(Vec::new());
+        };
+
+        Ok(index_array
+            .iter()
+            .filter_map(|group| group.get("artist").and_then(|a| a.as_array()))
+            .flatten()
+            .filter_map(|artist_val| serde_json::from_value::<models::Artist>(artist_val.clone()).ok())
+            .collect())
     }
 
     pub async fn get_album(&self, album_id: &str) -> Result<models::Album, SubsonicError> {

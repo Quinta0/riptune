@@ -51,8 +51,6 @@ pub enum PlaybackStatus {
     Buffering,
     Playing,
     Paused,
-    Stopped,
-    Error(String),
 }
 
 enum InputMode {
@@ -260,7 +258,6 @@ impl App {
                 // Shuffle & Repeat Controls
                 KeyCode::Char('s') => {
                     self.shuffle = !self.shuffle;
-                    self.notify_desktop_environment("Shuffle Toggled");
                 }
                 KeyCode::Char('r') => {
                     self.repeat = match self.repeat {
@@ -268,7 +265,6 @@ impl App {
                         RepeatMode::All => RepeatMode::One,
                         RepeatMode::One => RepeatMode::Off,
                     };
-                    self.notify_desktop_environment("Repeat Mode Changed");
                 }
                 KeyCode::Esc | KeyCode::Backspace => self.go_back().await,
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -313,21 +309,6 @@ impl App {
             },
         }
         false
-    }
-
-    // --- Option 2 Integration Hooks (MPRIS & Niri IPC Sync Channels) ---
-    fn notify_desktop_environment(&self, action_context: &str) {
-        // These hooks act as communication bridges for your riptune-mpris and riptune-niri subcrates[cite: 1]
-        // Example: Emits state logs that zbus / mpris handlers catch via standard asynchronous orchestration[cite: 1, 7]
-        if let Some(np) = &self.now_playing {
-            let _status_indicator = match np.status {
-                PlaybackStatus::Playing => "Playing",
-                PlaybackStatus::Paused => "Paused",
-                _ => "Stopped",
-            };
-            // Under-the-hood bindings read this payload state to dynamically broadcast D-Bus properties[cite: 1, 7]
-            std::string::ToString::to_string(&format!("MPRIS/NIRI Sync Triggered: {} -> {} ({})", action_context, np.title, _status_indicator));
-        }
     }
 
     async fn execute_db_search(&mut self, query: &str) {
@@ -452,7 +433,6 @@ impl App {
                     playlist_context,
                     cover_art_id: track.cover_art.clone(),
                 });
-                self.notify_desktop_environment("Track Started");
             }
             Err(e) => {
                 self.status_line = Some(format!("failed to build stream url: {e}"));
@@ -493,7 +473,6 @@ impl App {
                 }
                 _ => {}
             }
-            self.notify_desktop_environment("Play/Pause Toggled");
         } else if let Some(track) = self.tracks.get(self.selected_idx).cloned() {
             self.play_track(track, self.tracks.clone());
         }
@@ -549,7 +528,6 @@ impl App {
                     }
                 }
                 self.now_playing = None;
-                self.notify_desktop_environment("Track Stopped/Finished");
             }
             AudioEvent::Error(message) => {
                 self.status_line = Some(format!("playback error: {message}"));
@@ -948,7 +926,5 @@ fn playback_label(status: &PlaybackStatus) -> &str {
         PlaybackStatus::Buffering => "[...] buffering...",
         PlaybackStatus::Playing => "[>] playing",
         PlaybackStatus::Paused => "[||] paused",
-        PlaybackStatus::Stopped => "[.] stopped",
-        PlaybackStatus::Error(_) => "[X] error",
     }
 }

@@ -5,8 +5,6 @@
 //! about Subsonic — they only ever speak the standard MPRIS interface.
 //! Spec: <https://specifications.freedesktop.org/mpris-spec/latest/>
 
-use riptune_types::AudioCommand;
-use std::sync::mpsc::Sender;
 use zbus::{interface, ConnectionBuilder};
 
 pub struct MprisHandle {
@@ -19,39 +17,28 @@ impl MprisHandle {
     }
 }
 
-struct Player {
-    // Commands are relayed to the audio thread over this channel; MPRIS itself
-    // never touches audio state directly.
-    #[allow(dead_code)]
-    audio_tx: Sender<AudioCommand>,
-}
+// TODO: relay play_pause/next/previous to the audio thread's AudioCommand
+// channel and reflect real playback state once that wiring exists.
+struct Player;
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
-    async fn play_pause(&self) {
-        // TODO: relay to audio_tx based on current playback state
-    }
+    async fn play_pause(&self) {}
 
-    async fn next(&self) {
-        // TODO: emit AppEvent::NextTrack for app.rs to handle (advance in
-        // playlist, fetch new stream_url, send AudioCommand::Play)
-    }
+    async fn next(&self) {}
 
-    async fn previous(&self) {
-        // TODO
-    }
+    async fn previous(&self) {}
 
     #[zbus(property)]
     async fn playback_status(&self) -> String {
-        "Stopped".into() // TODO: reflect real state
+        "Stopped".into()
     }
 }
 
-pub async fn spawn(audio_tx: Sender<AudioCommand>) -> zbus::Result<MprisHandle> {
-    let player = Player { audio_tx };
+pub async fn spawn() -> zbus::Result<MprisHandle> {
     let conn = ConnectionBuilder::session()?
         .name("org.mpris.MediaPlayer2.riptune")?
-        .serve_at("/org/mpris/MediaPlayer2", player)?
+        .serve_at("/org/mpris/MediaPlayer2", Player)?
         .build()
         .await?;
     Ok(MprisHandle { conn })

@@ -6,7 +6,5 @@ license.workspace = true
 description = "MPRIS2 D-Bus interface so waybar/notification daemons can control riptune"
 
 [dependencies]
-riptune-types = { path = "../riptune-types" }
 tokio = { workspace = true }
-tracing = { workspace = true }
 zbus = { version = "4", default-features = false, features = ["tokio"] }

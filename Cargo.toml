@@ -4,7 +4,6 @@ members = [
     "crates/riptune-core",
     "crates/riptune-cache",
     "crates/riptune-mpris",
-    "crates/riptune-niri",
     "crates/riptune-tui",
     "crates/riptune-types",
 ]
@@ -42,7 +41,6 @@ path = "src/main.rs"
 riptune-core = { path = "crates/riptune-core" }
 riptune-cache = { path = "crates/riptune-cache" }
 riptune-mpris = { path = "crates/riptune-mpris" }
-riptune-niri = { path = "crates/riptune-niri" }
 riptune-tui = { path = "crates/riptune-tui" }
 riptune-types = { path = "crates/riptune-types" }
 tokio = { workspace = true }

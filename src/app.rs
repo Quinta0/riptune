@@ -7,7 +7,6 @@ use std::sync::mpsc::{Receiver, Sender};
 ///   - riptune_core::SubsonicClient  (REST API + streaming URLs)
 ///   - riptune_cache::Cache          (SQLite index, warmed on startup)
 ///   - riptune_mpris::Server         (D-Bus MPRIS2 interface)
-///   - riptune_niri::EventListener   (niri IPC event-stream socket)
 ///   - riptune_tui::App              (ratatui render loop)
 ///
 /// The TUI is the only piece that technically needs to run on the main thread on
@@ -26,26 +25,11 @@ pub async fn run(cfg: Config, audio_tx: Sender<AudioCommand>, audio_events: Rece
         }
     });
 
-    // Kept so we can abort this task once the TUI quits.
-    let niri_task = if cfg.niri.enabled {
-        let audio_tx = audio_tx.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = riptune_niri::listen(audio_tx).await {
-                tracing::warn!(error = %e, "niri IPC listener exited");
-            }
-        }))
-    } else {
-        None
-    };
-
-    let mpris_handle = riptune_mpris::spawn(audio_tx.clone()).await?;
+    let mpris_handle = riptune_mpris::spawn().await?;
 
     riptune_tui::App::new(client, cache, audio_tx.clone(), audio_events, cfg.theme.clone()).run().await?;
 
     sync_task.abort();
-    if let Some(task) = niri_task {
-        task.abort();
-    }
     mpris_handle.shutdown().await;
 
     let _ = audio_tx.send(AudioCommand::Stop);

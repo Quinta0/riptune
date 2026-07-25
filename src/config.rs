@@ -6,8 +6,6 @@ use std::path::PathBuf;
 pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
-    pub niri: NiriConfig,
-    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
     pub theme: riptune_types::ThemeColors,
@@ -21,21 +19,6 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct NiriConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[allow(dead_code)]
-    #[serde(default = "default_true")]
-    pub workspace_notifications: bool,
-}
-
-impl Default for NiriConfig {
-    fn default() -> Self {
-        Self { enabled: true, workspace_notifications: true }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "default_cache_path")]
     pub path: PathBuf,
@@ -45,10 +28,6 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self { path: default_cache_path() }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_cache_path() -> PathBuf {
@@ -114,11 +93,10 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(raw).expect("minimal config should parse");
         assert_eq!(cfg.server.url, "https://music.example.com");
-        assert!(cfg.niri.enabled);
     }
 
     #[test]
-    fn niri_and_cache_sections_are_optional() {
+    fn cache_section_is_optional() {
         let raw = r#"
             [server]
             url = "https://music.example.com"
@@ -126,6 +104,6 @@ mod tests {
             password = "secret"
         "#;
         let cfg: Config = toml::from_str(raw).expect("minimal config should parse");
-        assert!(cfg.niri.enabled, "niri.enabled should default to true");
+        assert!(cfg.cache.path.ends_with("library.sqlite"));
     }
 }

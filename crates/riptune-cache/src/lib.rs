@@ -102,18 +102,7 @@ impl Cache {
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows.into_iter().map(|row| {
-            let count: i64 = row.get("song_count");
-            let year: Option<i64> = row.get("year");
-            AlbumSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                song_count: count as u32,
-                year: year.map(|y| y as u32),
-            }
-        }).collect();
-
-        Ok(records)
+        Ok(rows.into_iter().map(row_to_album).collect())
     }
 
     /// Tracklist for an album, in soundtrack order (disc, then track number)
@@ -144,17 +133,7 @@ impl Cache {
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows.into_iter().map(|row| {
-            let count: i64 = row.get("album_count");
-            Artist {
-                id: row.get("id"),
-                name: row.get("name"),
-                album_count: count as u32,
-                cover_art: None,
-            }
-        }).collect();
-
-        Ok(records)
+        Ok(rows.into_iter().map(row_to_artist).collect())
     }
 
     pub async fn search_local_albums(&self, query: &str) -> Result<Vec<AlbumSummary>, CacheError> {
@@ -166,18 +145,7 @@ impl Cache {
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows.into_iter().map(|row| {
-            let count: i64 = row.get("song_count");
-            let year: Option<i64> = row.get("year");
-            AlbumSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                song_count: count as u32,
-                year: year.map(|y| y as u32),
-            }
-        }).collect();
-
-        Ok(records)
+        Ok(rows.into_iter().map(row_to_album).collect())
     }
 
     pub async fn search_local_tracks(&self, query: &str) -> Result<Vec<Track>, CacheError> {
@@ -195,6 +163,27 @@ impl Cache {
         let records = rows.into_iter().map(row_to_track).collect();
 
         Ok(records)
+    }
+}
+
+fn row_to_artist(row: sqlx::sqlite::SqliteRow) -> Artist {
+    let count: i64 = row.get("album_count");
+    Artist {
+        id: row.get("id"),
+        name: row.get("name"),
+        album_count: count as u32,
+        cover_art: None,
+    }
+}
+
+fn row_to_album(row: sqlx::sqlite::SqliteRow) -> AlbumSummary {
+    let count: i64 = row.get("song_count");
+    let year: Option<i64> = row.get("year");
+    AlbumSummary {
+        id: row.get("id"),
+        name: row.get("name"),
+        song_count: count as u32,
+        year: year.map(|y| y as u32),
     }
 }
 

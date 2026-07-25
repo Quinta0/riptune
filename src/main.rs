@@ -3,7 +3,6 @@
 mod app;
 mod audio;
 mod config;
-mod events;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
