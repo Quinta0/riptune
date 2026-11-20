@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod config;
+mod setup;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,25 +26,36 @@ enum Command {
     /// List all artists from the server, then exit. Useful for confirming
     /// auth + JSON parsing work before the TUI can display anything.
     Artists,
+    /// Interactively create (or replace) the config file. Also runs
+    /// automatically the first time riptune starts without one.
+    Setup,
 }
 
 fn main() -> Result<()> {
     init_logging()?;
     let cli = Cli::parse();
 
-    let cfg = config::Config::load(cli.config)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let config_path = cli.config.unwrap_or_else(config::default_config_path);
+
+    if matches!(cli.command, Some(Command::Setup)) {
+        return runtime.block_on(setup::run(&config_path));
+    }
+    if !config_path.exists() {
+        runtime.block_on(setup::run(&config_path))?;
+        if cli.command.is_none() {
+            println!("Starting riptune...");
+        }
+    }
+
+    let cfg = config::Config::load(&config_path)?;
 
     if let Some(command) = cli.command {
-        let runtime = tokio::runtime::Runtime::new()?;
         return runtime.block_on(run_command(command, cfg));
     }
 
     let (audio_event_tx, audio_events) = tokio::sync::mpsc::unbounded_channel();
     let (audio_tx, _audio_handle) = audio::spawn(audio_event_tx)?;
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
 
     runtime.block_on(async {
         // Inside the TUI, raw mode turns Ctrl+C into a key event (handled
@@ -92,6 +104,7 @@ async fn run_command(command: Command, cfg: config::Config) -> Result<()> {
             client.ping().await?;
             println!("connected to {}", cfg.server.url);
         }
+        Command::Setup => unreachable!("handled before the config is loaded"),
         Command::Artists => {
             let artists = client.get_artists().await?;
             for artist in &artists {

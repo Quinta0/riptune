@@ -44,9 +44,8 @@ fn dirs_cache_dir() -> PathBuf {
 }
 
 impl Config {
-    pub fn load(explicit_path: Option<PathBuf>) -> Result<Self> {
-        let path = explicit_path.unwrap_or_else(default_config_path);
-        let raw = std::fs::read_to_string(&path)
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config at {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing config at {}", path.display()))?;
@@ -64,7 +63,7 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     }
 }
 
-fn default_config_path() -> PathBuf {
+pub fn default_config_path() -> PathBuf {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

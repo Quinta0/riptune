@@ -102,7 +102,9 @@ riptune/
 
 ## Configuration
 
-`~/.config/riptune/config.toml`:
+The first time you run `riptune` without a config, a short setup wizard asks for your server URL, username and password, checks them against the server, and saves `~/.config/riptune/config.toml` (readable only by you). Run `riptune setup` any time to change them.
+
+You can also write the file by hand, `~/.config/riptune/config.toml`:
 
 ```toml
 [server]

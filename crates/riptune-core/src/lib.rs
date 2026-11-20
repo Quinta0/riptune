@@ -38,7 +38,7 @@ impl SubsonicClient {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
-            base_url: url::Url::parse(base_url)?,
+            base_url: base_with_trailing_slash(base_url)?,
             username: username.to_string(),
             password: password.to_string(),
         })
@@ -217,9 +217,30 @@ impl SubsonicClient {
     }
 }
 
+/// `Url::join` replaces the last path segment unless the base ends in `/`,
+/// so a server under a subpath (`https://host/navidrome`) would otherwise
+/// have its requests sent to `https://host/rest/...`.
+fn base_with_trailing_slash(base_url: &str) -> Result<url::Url, url::ParseError> {
+    let mut url = url::Url::parse(base_url)?;
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subpath_installs_keep_their_prefix() {
+        for base in ["https://host/navidrome", "https://host/navidrome/"] {
+            let client = SubsonicClient::new(base, "alice", "pw").unwrap();
+            let url = client.stream_url("1").unwrap();
+            assert!(url.starts_with("https://host/navidrome/rest/stream"), "{url}");
+        }
+    }
 
     #[test]
     fn stream_url_includes_required_auth_params() {

@@ -49,6 +49,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 toml = "0.8"
+# Hidden password input in `riptune setup`; same version the TUI already uses.
+crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: rodio 0.21 reworked the OutputStream/Sink API around a new
 # Mixer type (Sink::try_new -> Sink::connect_new, etc). Pinning avoids that
