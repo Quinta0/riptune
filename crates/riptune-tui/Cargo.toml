@@ -27,3 +27,4 @@ ratatui-image = { version = "2.0.1", default-features = false, features = ["cros
 # version ratatui-image itself resolves to (see Cargo.lock) so DynamicImage
 # is the same type on both sides.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+unicode-width = "0.1"

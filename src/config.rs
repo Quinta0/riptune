@@ -48,9 +48,19 @@ impl Config {
         let path = explicit_path.unwrap_or_else(default_config_path);
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config at {}", path.display()))?;
-        let cfg: Config = toml::from_str(&raw)
+        let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing config at {}", path.display()))?;
+        cfg.cache.path = expand_tilde(&cfg.cache.path);
         Ok(cfg)
+    }
+}
+
+/// `~/x` -> `$HOME/x`. TOML has no shell expansion, and the example config
+/// uses `~`, which would otherwise create a literal `./~` directory.
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -93,6 +103,14 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(raw).expect("minimal config should parse");
         assert_eq!(cfg.server.url, "https://music.example.com");
+    }
+
+    #[test]
+    fn tilde_is_expanded_in_cache_path() {
+        let expanded = expand_tilde(std::path::Path::new("~/.cache/riptune/library.sqlite"));
+        assert!(!expanded.starts_with("~"));
+        assert!(expanded.ends_with(".cache/riptune/library.sqlite"));
+        assert_eq!(expand_tilde(std::path::Path::new("/abs/path")), PathBuf::from("/abs/path"));
     }
 
     #[test]

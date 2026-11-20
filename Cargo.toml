@@ -59,3 +59,8 @@ rodio = { version = "=0.20.1", features = ["symphonia-all"] }
 # synchronous fetch -- see the comment in src/audio.rs for why blocking is
 # actually the right call there, not a shortcut.
 reqwest = { workspace = true, features = ["blocking"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

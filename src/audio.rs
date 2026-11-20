@@ -2,40 +2,39 @@
 //!
 //! Deliberately NOT async. Decoding+output (rodio, backed by cpal) run on a
 //! dedicated OS thread; the only interface to the rest of the app is the
-//! bounded `AudioCommand` channel in and `AudioEvent` channel out. A stalled
-//! network fetch here can never block the tokio runtime or the TUI render
-//! loop, because it isn't sharing a thread with either of them.
+//! `AudioCommand` channel in and `AudioEvent` channel out. A stalled network
+//! fetch can never block the tokio runtime or the TUI render loop.
 //!
-//! Current implementation downloads a track fully before playback starts
-//! (see the comment in `handle_command` below) rather than streaming
-//! decode-as-you-download. That's a deliberate MVP simplification, not an
-//! oversight -- real progressive streaming is a good next step once this is
-//! working end to end.
+//! Tracks are streamed progressively: a download thread appends bytes into a
+//! shared buffer and the decoder reads from it as they arrive (see
+//! [`StreamBuffer`]), so playback starts after the first few kilobytes rather
+//! than after the whole file. Opening a track (connect + format probe) runs
+//! on a short-lived loader thread so the command loop stays responsive --
+//! skipping through tracks quickly never queues up a backlog of downloads.
 
-use crate::config::Config;
 use anyhow::Result;
-pub use riptune_types::{AudioCommand, AudioEvent};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
-use std::io::Cursor;
+pub use riptune_types::{AudioCommand, AudioEvent, PlayToken};
+use rodio::{Decoder, OutputStream, Sink};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
-pub fn spawn(_cfg: Config) -> Result<(Sender<AudioCommand>, Receiver<AudioEvent>, JoinHandle<()>)> {
+type TrackDecoder = Decoder<StreamBuffer>;
+
+pub fn spawn(event_tx: UnboundedSender<AudioEvent>) -> Result<(Sender<AudioCommand>, JoinHandle<()>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
-    let (event_tx, event_rx) = mpsc::channel::<AudioEvent>();
-
     let handle = std::thread::Builder::new()
         .name("riptune-audio".into())
         .spawn(move || run_audio_loop(cmd_rx, event_tx))?;
-
-    Ok((cmd_tx, event_rx, handle))
+    Ok((cmd_tx, handle))
 }
 
-fn run_audio_loop(cmd_rx: Receiver<AudioCommand>, event_tx: Sender<AudioEvent>) {
+fn run_audio_loop(cmd_rx: Receiver<AudioCommand>, event_tx: UnboundedSender<AudioEvent>) {
     // _stream must be kept alive for as long as we want playback to work --
-    // dropping it silently stops all audio. It intentionally lives for the
-    // rest of this function (i.e. the thread's whole lifetime).
+    // dropping it silently stops all audio.
     let (_stream, stream_handle) = match OutputStream::try_default() {
         Ok(pair) => pair,
         Err(e) => {
@@ -44,130 +43,266 @@ fn run_audio_loop(cmd_rx: Receiver<AudioCommand>, event_tx: Sender<AudioEvent>) 
         }
     };
 
-    let http = reqwest::blocking::Client::new();
+    let http = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        // No overall timeout: it would also cover the body, and a long FLAC
+        // over a slow link legitimately takes longer than any fixed limit.
+        .timeout(None)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = event_tx.send(AudioEvent::Error(format!("failed to build http client: {e}")));
+            return;
+        }
+    };
+
+    let (loaded_tx, loaded_rx) = mpsc::channel::<(PlayToken, Result<TrackDecoder, String>)>();
     let mut sink: Option<Sink> = None;
-    // Owned by the audio thread, not the TUI, so a freshly created Sink for
-    // the next track always starts at the volume the user last set instead
-    // of silently resetting to 100%.
-    let mut current_volume: f32 = 1.0;
+    let mut current: Option<PlayToken> = None;
+    let mut last_reported_sec: Option<u64> = None;
+    let mut volume: f32 = 1.0;
 
     loop {
-        // Short timeout so we still get to check on playback progress
-        // (position/finished) even when no new command has arrived.
-        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(AudioCommand::Stop) => {
-                // Drop sink explicitly to free audio hardware resources
-                drop(sink.take());
-                break; // Exit the audio thread loop!
+        match cmd_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(AudioCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(AudioCommand::Play { stream_url, token }) => {
+                // Silence the old track immediately rather than letting it
+                // run on while the new one buffers.
+                sink = None;
+                current = Some(token);
+                last_reported_sec = None;
+                let http = http.clone();
+                let tx = loaded_tx.clone();
+                let _ = std::thread::Builder::new()
+                    .name("riptune-loader".into())
+                    .spawn(move || {
+                        let _ = tx.send((token, open_track(&http, &stream_url)));
+                    });
             }
-            Ok(command) => handle_command(
-                command,
-                &stream_handle,
-                &mut sink,
-                &http,
-                &event_tx,
-                &mut current_volume,
-            ),
-            Err(RecvTimeoutError::Disconnected) => break,
+            Ok(AudioCommand::Pause) => {
+                if let Some(s) = &sink {
+                    s.pause();
+                }
+            }
+            Ok(AudioCommand::Resume) => {
+                if let Some(s) = &sink {
+                    s.play();
+                }
+            }
+            Ok(AudioCommand::Seek(pos)) => {
+                if let Some(s) = &sink {
+                    if let Err(e) = s.try_seek(pos) {
+                        let _ = event_tx.send(AudioEvent::Error(format!("seek failed: {e}")));
+                    }
+                    last_reported_sec = None;
+                }
+            }
+            Ok(AudioCommand::SetVolume(v)) => {
+                volume = v;
+                if let Some(s) = &sink {
+                    s.set_volume(v);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
 
-        if let Some(active) = &sink {
-            if active.empty() {
-                if !active.is_paused() {
-                    // Queue drained without an explicit Stop -> the track played through.
-                    let _ = event_tx.send(AudioEvent::TrackFinished);
-                    sink = None;
+        // Finished loads. Anything not matching the current token was
+        // superseded by a later Play and is simply dropped, which also
+        // stops its download (see StreamBuffer's Drop).
+        while let Ok((token, result)) = loaded_rx.try_recv() {
+            if Some(token) != current {
+                continue;
+            }
+            match result.and_then(|decoder| {
+                let s = Sink::try_new(&stream_handle).map_err(|e| format!("failed to open playback sink: {e}"))?;
+                s.set_volume(volume);
+                s.append(decoder);
+                Ok(s)
+            }) {
+                Ok(s) => sink = Some(s),
+                Err(e) => {
+                    current = None;
+                    let _ = event_tx.send(AudioEvent::LoadFailed(token, e));
                 }
-            } else if !active.is_paused() {
-                // Deliberately skip sending a position update while paused --
-                // otherwise the TUI keeps receiving "still playing" signals
-                // for a track that isn't, and flips its own paused state
-                // back to Playing within a couple hundred milliseconds.
-                let _ = event_tx.send(AudioEvent::PositionChanged(active.get_pos()));
+            }
+        }
+
+        if let (Some(s), Some(token)) = (&sink, current) {
+            if s.empty() {
+                let _ = event_tx.send(AudioEvent::Finished(token));
+                sink = None;
+                current = None;
+            } else if !s.is_paused() {
+                let pos = s.get_pos();
+                if last_reported_sec != Some(pos.as_secs()) {
+                    last_reported_sec = Some(pos.as_secs());
+                    let _ = event_tx.send(AudioEvent::Position(token, pos));
+                }
             }
         }
     }
 }
 
-fn handle_command(
-    command: AudioCommand,
-    stream_handle: &OutputStreamHandle,
-    sink: &mut Option<Sink>,
-    http: &reqwest::blocking::Client,
-    event_tx: &Sender<AudioEvent>,
-    current_volume: &mut f32,
-) {
-    match command {
-        AudioCommand::Play { stream_url } => {
-            let _ = event_tx.send(AudioEvent::Buffering);
+/// Connects, starts the background download, and probes the format. Runs on
+/// a loader thread; blocks only until the decoder has seen enough header
+/// bytes to identify the stream.
+fn open_track(http: &reqwest::blocking::Client, url: &str) -> Result<TrackDecoder, String> {
+    let response = http
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("failed to fetch track: {e}"))?;
+    let buffer = StreamBuffer::start(response);
+    Decoder::new(buffer).map_err(|e| format!("failed to decode track: {e}"))
+}
 
-            // NOTE: fetches the whole track into memory before decoding. Fine
-            // for typical track sizes (a few MB); the "async pipeline" this
-            // project advertises still holds at the thread-isolation level
-            // (this blocking call can never stall the TUI or tokio runtime),
-            // but true progressive streaming -- decoding as bytes arrive --
-            // is real follow-up work, not yet done.
-            let response = match http.get(&stream_url).send().and_then(|r| r.error_for_status()) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = event_tx.send(AudioEvent::Error(format!("failed to fetch track: {e}")));
-                    return;
-                }
-            };
-            let bytes = match response.bytes() {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = event_tx.send(AudioEvent::Error(format!("failed to read track body: {e}")));
-                    return;
-                }
-            };
+#[derive(Default)]
+struct Shared {
+    data: Vec<u8>,
+    total_len: Option<u64>,
+    done: bool,
+    error: Option<String>,
+}
 
-            let source = match Decoder::new(Cursor::new(bytes.to_vec())) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = event_tx.send(AudioEvent::Error(format!("failed to decode track: {e}")));
-                    return;
-                }
-            };
+/// A `Read + Seek` view over an HTTP body that is still downloading. Reads
+/// past the downloaded edge block until the bytes arrive (or the download
+/// ends); dropping the reader makes the download thread stop early.
+struct StreamBuffer {
+    shared: Arc<(Mutex<Shared>, Condvar)>,
+    pos: u64,
+}
 
-            let new_sink = match Sink::try_new(stream_handle) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = event_tx.send(AudioEvent::Error(format!("failed to open playback sink: {e}")));
+impl StreamBuffer {
+    fn start(mut response: reqwest::blocking::Response) -> Self {
+        let total_len = response.content_length();
+        let shared = Arc::new((
+            Mutex::new(Shared {
+                data: Vec::with_capacity(total_len.unwrap_or(0).min(512 << 20) as usize),
+                total_len,
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
+
+        let writer = Arc::clone(&shared);
+        let _ = std::thread::Builder::new().name("riptune-download".into()).spawn(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                // Reader gone (track skipped/finished): stop downloading.
+                if Arc::strong_count(&writer) == 1 {
                     return;
                 }
-            };
-            new_sink.set_volume(*current_volume);
-            new_sink.append(source);
-            new_sink.play();
-            *sink = Some(new_sink);
-        }
-        AudioCommand::Pause => {
-            if let Some(s) = sink.as_ref() {
-                s.pause();
-            }
-        }
-        AudioCommand::Resume => {
-            if let Some(s) = sink.as_ref() {
-                s.play();
-            }
-        }
-        AudioCommand::Stop => {
-            *sink = None;
-        }
-        AudioCommand::Seek(pos) => {
-            if let Some(s) = sink.as_ref() {
-                if let Err(e) = s.try_seek(pos) {
-                    let _ = event_tx.send(AudioEvent::Error(format!("seek failed: {e}")));
+                let read = response.read(&mut chunk);
+                let (lock, cvar) = &*writer;
+                let mut s = lock.lock().unwrap();
+                match read {
+                    Ok(0) => s.done = true,
+                    Ok(n) => s.data.extend_from_slice(&chunk[..n]),
+                    Err(e) => {
+                        s.error = Some(e.to_string());
+                        s.done = true;
+                    }
+                }
+                let finished = s.done;
+                drop(s);
+                cvar.notify_all();
+                if finished {
+                    return;
                 }
             }
+        });
+
+        Self { shared, pos: 0 }
+    }
+}
+
+impl Read for StreamBuffer {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (lock, cvar) = &*self.shared;
+        let s = cvar
+            .wait_while(lock.lock().unwrap(), |s| (s.data.len() as u64) <= self.pos && !s.done)
+            .unwrap();
+        let available = s.data.len() as u64;
+        if self.pos >= available {
+            return match &s.error {
+                Some(e) => Err(io::Error::other(e.clone())),
+                None => Ok(0),
+            };
         }
-        AudioCommand::SetVolume(volume) => {
-            *current_volume = volume;
-            if let Some(s) = sink.as_ref() {
-                s.set_volume(volume);
+        let start = self.pos as usize;
+        let n = buf.len().min(s.data.len() - start);
+        buf[..n].copy_from_slice(&s.data[start..start + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for StreamBuffer {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => {
+                // Without a Content-Length the end is only known once the
+                // download completes.
+                let (lock, cvar) = &*self.shared;
+                let s = cvar.wait_while(lock.lock().unwrap(), |s| s.total_len.is_none() && !s.done).unwrap();
+                s.total_len.unwrap_or(s.data.len() as u64) as i64 + d
             }
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start of stream"));
         }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_with(data: &[u8], done: bool) -> StreamBuffer {
+        StreamBuffer {
+            shared: Arc::new((
+                Mutex::new(Shared { data: data.to_vec(), total_len: Some(data.len() as u64), done, error: None }),
+                Condvar::new(),
+            )),
+            pos: 0,
+        }
+    }
+
+    #[test]
+    fn reads_and_seeks_within_downloaded_data() {
+        let mut b = buffer_with(b"hello world", true);
+        let mut out = [0u8; 5];
+        b.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"hello");
+        b.seek(SeekFrom::End(-5)).unwrap();
+        let mut rest = Vec::new();
+        b.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"world");
+    }
+
+    #[test]
+    fn read_waits_for_more_data() {
+        let b = buffer_with(b"ab", false);
+        let shared = Arc::clone(&b.shared);
+        let reader = std::thread::spawn(move || {
+            let mut b = b;
+            let mut all = Vec::new();
+            b.read_to_end(&mut all).unwrap();
+            all
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        {
+            let (lock, cvar) = &*shared;
+            let mut s = lock.lock().unwrap();
+            s.data.extend_from_slice(b"cd");
+            s.done = true;
+            cvar.notify_all();
+        }
+        assert_eq!(reader.join().unwrap(), b"abcd");
     }
 }
