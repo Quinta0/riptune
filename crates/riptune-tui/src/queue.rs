@@ -146,7 +146,7 @@ mod tests {
         let mut q = Queue::new(tracks(50), 7, true);
         assert_eq!(q.current().unwrap().id, "7");
         let mut seen = vec![q.current_index().unwrap()];
-        while let Some(_) = q.advance(false) {
+        while q.advance(false).is_some() {
             seen.push(q.current_index().unwrap());
         }
         seen.sort();

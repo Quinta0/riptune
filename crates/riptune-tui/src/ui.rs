@@ -95,7 +95,11 @@ fn draw_pane(app: &mut App, f: &mut Frame, area: Rect, pane: Focus) {
     if let Some(q) = query.as_deref().filter(|q| !q.is_empty()) {
         title.push(Span::styled(format!("/{} ", truncate(q, 20)), Style::new().fg(theme.accent)));
     }
-    title.push(Span::styled(format!("{len} "), Style::new().fg(theme.text_muted)));
+    // Short searches are capped by the cache; don't claim an exact count.
+    let capped = query.as_deref().is_some_and(|q| !q.is_empty() && q.chars().count() < 3)
+        && len >= riptune_cache::SHORT_QUERY_LIMIT;
+    let count = if capped { format!("{len}+ ") } else { format!("{len} ") };
+    title.push(Span::styled(count, Style::new().fg(theme.text_muted)));
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
