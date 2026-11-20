@@ -8,9 +8,15 @@
 
 use std::time::Duration;
 
+/// Identifies one `Play` request. Every event about a specific track carries
+/// the token of the `Play` that started it, so the TUI can drop events that
+/// were already in flight when the user skipped to something else (otherwise
+/// a late `Finished` from the old track would skip the new one too).
+pub type PlayToken = u64;
+
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
-    Play { stream_url: String },
+    Play { stream_url: String, token: PlayToken },
     Pause,
     Resume,
     Stop,
@@ -20,9 +26,13 @@ pub enum AudioCommand {
 
 #[derive(Debug, Clone)]
 pub enum AudioEvent {
-    PositionChanged(Duration),
-    TrackFinished,
-    Buffering,
+    /// Playback position, sent at most once per elapsed second (the UI only
+    /// displays whole seconds, so finer updates would just be wasted redraws).
+    Position(PlayToken, Duration),
+    Finished(PlayToken),
+    /// The track could not be fetched or decoded.
+    LoadFailed(PlayToken, String),
+    /// Anything else (device errors, failed seeks).
     Error(String),
 }
 
@@ -32,17 +42,12 @@ pub enum AudioEvent {
 /// a dependency cycle. Any field left unset, or that fails to parse, falls
 /// back to riptune-tui's built-in default for that color.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
 pub struct ThemeColors {
-    #[serde(default)]
     pub accent: Option<String>,
-    #[serde(default)]
     pub now_playing: Option<String>,
-    #[serde(default)]
     pub error: Option<String>,
-    #[serde(default)]
     pub border_focused: Option<String>,
-    #[serde(default)]
     pub border_unfocused: Option<String>,
-    #[serde(default)]
     pub selection_bg: Option<String>,
 }

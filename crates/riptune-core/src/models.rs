@@ -39,6 +39,8 @@ pub struct Track {
     pub artist: Option<String>,
     #[serde(default)]
     pub album: Option<String>,
+    #[serde(rename = "albumId", default)]
+    pub album_id: Option<String>,
     #[serde(rename = "duration", default)]
     pub duration_secs: Option<u32>,
     #[serde(default)]

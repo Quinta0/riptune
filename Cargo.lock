@@ -2415,6 +2415,7 @@ dependencies = [
  "riptune-types",
  "tokio",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]

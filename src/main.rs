@@ -38,20 +38,19 @@ fn main() -> Result<()> {
         return runtime.block_on(run_command(command, cfg));
     }
 
-    let (audio_tx, audio_events, _audio_handle) = audio::spawn(cfg.clone())?;
+    let (audio_event_tx, audio_events) = tokio::sync::mpsc::unbounded_channel();
+    let (audio_tx, _audio_handle) = audio::spawn(audio_event_tx)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     runtime.block_on(async {
+        // Inside the TUI, raw mode turns Ctrl+C into a key event (handled
+        // there); this only catches SIGINT sent from outside, e.g. `kill -INT`.
         tokio::select! {
             res = app::run(cfg, audio_tx, audio_events) => res,
-            _ = tokio::signal::ctrl_c() => {
-                // When Ctrl+C is pressed, returning Ok(()) drops the TUI instance,
-                // triggering the `TerminalCleanup` guard in riptune-tui automatically!
-                Ok(())
-            }
+            _ = tokio::signal::ctrl_c() => Ok(()),
         }
     })
 }
